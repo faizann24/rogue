@@ -78,12 +78,17 @@ Examples:
     parser.add_argument('-p', '--num-plans',
                         type=int,
                         default=10,
-                        help='Number of security testing plans to generate per page. Use -1 for unlimited plans (15-25+ comprehensive tests with contextual CVE intelligence). Default: 10')
+                        help='Number of security testing plans to generate per page. Uses iterative planning: fixed plans are divided into 3 batches (33%% each), unlimited plans (-1) generate 5 plans per batch with adaptive learning. Default: 10')
 
     parser.add_argument('--disable-rag',
                         action='store_true',
                         default=False,
                         help='Disable RAG knowledge fetching for faster startup')
+
+    parser.add_argument('--disable-iterative',
+                        action='store_true',
+                        default=False,
+                        help='Disable iterative planning and generate all plans at once (legacy mode)')
 
     args = parser.parse_args()
     
@@ -115,6 +120,7 @@ if __name__ == "__main__":
         output_dir=args.output,
         max_iterations=args.max_iterations,
         num_plans=args.num_plans,
-        disable_rag=args.disable_rag
+        disable_rag=args.disable_rag,
+        disable_iterative=args.disable_iterative
     )
     agent.run()

@@ -144,3 +144,66 @@ class Planner:
             return items[:self.num_plans_target]
         else:
             return items  # Return all plans when unlimited
+
+    @retry_on_yaml_error()
+    def plan_batch(self, context_data: str, batch_size: int) -> List[Dict]:
+        """
+        Generate a batch of security testing plans with iterative context.
+        
+        Args:
+            context_data (str): Input message containing page information and execution insights
+            batch_size (int): Number of plans to generate in this batch
+            
+        Returns:
+            List[Dict]: List of testing plan items, each containing title and description
+        """
+        # Create a modified system prompt for batch planning
+        batch_prompt = self.system_prompt.replace(
+            "as many comprehensive security test plans as possible (aim for 15-25+ distinct plans)",
+            f"exactly {batch_size} distinct security test plans"
+        ).replace(
+            f"{self.num_plans_target} distinct security test plans",
+            f"exactly {batch_size} distinct security test plans"
+        )
+        
+        # Add iterative planning instruction
+        batch_prompt += f"""
+
+        IMPORTANT: Generate exactly {batch_size} new and unique security test plans. If execution insights are provided, use them to:
+        1. Avoid repeating failed approaches unless you have a new angle
+        2. Build upon successful techniques with variations
+        3. Focus on areas that haven't been thoroughly tested yet
+        4. Consider chaining attacks based on discovered vulnerabilities
+        
+        Ensure each plan is distinct and targets different attack vectors or methodologies."""
+        
+        messages = [
+            {"role": "system", "content": batch_prompt},
+            {"role": "user", "content": context_data}
+        ]
+        
+        response = self.client.chat.completions.create(
+            model="o3-mini",
+            messages=messages,
+        )
+        
+        # Parse YAML response into list of dicts
+        yaml_str = response.choices[0].message.content
+        
+        # Strip markdown code blocks if present
+        if yaml_str.strip().startswith('```'):
+            # Remove opening ```yaml or ``` 
+            lines = yaml_str.strip().split('\n')
+            if lines[0].startswith('```'):
+                lines = lines[1:]
+            # Remove closing ```
+            if lines and lines[-1].strip() == '```':
+                lines = lines[:-1]
+            yaml_str = '\n'.join(lines)
+        
+        items = yaml.safe_load(yaml_str)
+        if not isinstance(items, list):
+            items = [items]
+        
+        # Return exactly the requested batch size
+        return items[:batch_size]

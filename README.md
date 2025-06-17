@@ -19,6 +19,7 @@ Note: This is a very early release with many planned improvements and features s
 ## 🌟 Key Features
 
 - **Intelligent Vulnerability Discovery**: Uses LLMs to understand application context and identify potential security weaknesses
+- **Iterative Planning**: Generates security tests in batches, learning from execution results to improve subsequent plans
 - **Advanced Payload Generation**: Creates sophisticated test payloads tailored to the target application
 - **Context-Aware Testing**: Analyzes application behavior and responses to guide testing strategy
 - **Automated Exploit Verification**: Validates findings to eliminate false positives
@@ -74,6 +75,8 @@ python run.py -u https://example.com -p -1 -i 5
 |--------|-------------|---------|---------|
 | `-p, --num-plans` | Number of security test plans per page | `10` | `-p 15` (specific count)<br>`-p -1` (unlimited) |
 | `-i, --max-iterations` | Maximum iterations per security plan | `10` | `-i 5` (quick scan)<br>`-i 20` (thorough) |
+| `--disable-rag` | Disable RAG knowledge fetching for faster startup | `false` | `--disable-rag` |
+| `--disable-iterative` | Disable iterative planning and use legacy mode (all plans generated at once) | `false` | `--disable-iterative` |
 | `-m, --model` | LLM model for analysis | `o4-mini` | `-m o3-mini`<br>`-m o1-preview` |
 
 ### Scope and Discovery
@@ -89,34 +92,33 @@ python run.py -u https://example.com -p -1 -i 5
 
 ## 📋 Usage Examples
 
-### Quick Security Assessment
 ```bash
-# Fast scan with 5 focused plans, 3 iterations each
-python run.py -u https://target.com -p 5 -i 3
-```
+# Quick security assessment (5 plans, 3 iterations each)
+python run.py -u https://example.com -p 5 -i 3
 
-### Comprehensive Security Audit
-```bash
-# Unlimited plans with contextual CVE intelligence, thorough testing
-python run.py -u https://target.com -p -1 -i 10 -e -s
-```
+# Standard comprehensive scan with iterative planning (default)
+python run.py -u https://example.com -p 10 -i 10
 
-### Targeted Vulnerability Research
-```bash
-# Deep analysis with maximum iterations and scope expansion
-python run.py -u https://target.com -p 20 -i 15 -e -m o1-preview
-```
+# Legacy mode - all plans generated at once (faster startup)
+python run.py -u https://example.com -p 10 -i 10 --disable-iterative
 
-### Subdomain Security Assessment
-```bash
-# Discover and test all subdomains with moderate depth
-python run.py -u https://target.com -s -p 10 -i 7
-```
+# Unlimited plans with iterative learning (15-25+ adaptive plans)
+python run.py -u https://example.com -p -1 -i 5
 
-### Custom Output Directory
-```bash
-# Organize results by target and date
-python run.py -u https://target.com -o "results/target_$(date +%Y%m%d)" -p -1
+# Unlimited plans in legacy mode (generates many plans upfront)
+python run.py -u https://example.com -p -1 -i 5 --disable-iterative
+
+# Deep security audit with scope expansion and iterative planning
+python run.py -u https://example.com -p -1 -i 10 -e -s
+
+# Fast startup with disabled RAG and legacy planning
+python run.py -u https://example.com -p 5 -i 3 --disable-rag --disable-iterative
+
+# Targeted research with advanced model and iterative planning
+python run.py -u https://example.com -p 20 -i 15 -m o1-preview
+
+# Custom output directory with subdomain enumeration
+python run.py -u https://example.com -s -o "results/$(date +%Y%m%d)" -p -1
 ```
 
 ## 🎯 Security Testing Modes
@@ -170,15 +172,25 @@ python run.py -u https://target.com -o "results/target_$(date +%Y%m%d)" -p -1
 
 ## 🧠 Advanced Features
 
+### Iterative Planning vs Legacy Mode
+
+**Iterative Planning (Default)**
+- Plans are generated in batches that learn from previous execution results
+- For fixed plans: divided into 3 batches (33% each, max 3 batches)  
+- For unlimited plans (-p -1): generated in batches of 5 (max 5 batches = 25 plans)
+- Each batch uses insights from previous plan executions to generate more targeted tests
+- Adaptive learning improves success rates and reduces redundant testing
+
+**Legacy Mode (--disable-iterative)**
+- All plans generated upfront in a single batch
+- No learning between plan executions
+- Faster initial planning but potentially less targeted testing
+- Useful for consistent, reproducible test scenarios
+
 ### Contextual Intelligence
 - **Technology Detection**: Automatically identifies frameworks, CMS, libraries
 - **CVE Integration**: Fetches relevant vulnerabilities from CISA KEV catalog
 - **Smart Targeting**: Focuses tests on detected technologies
-
-### Iterative Planning
-- **Memory Management**: Maintains context across test iterations
-- **Adaptive Strategy**: Learns from previous attempts
-- **Failure Recovery**: Continues testing when exploits fail
 
 ### Traffic Analysis
 - **Request Monitoring**: Captures all HTTP/HTTPS traffic
