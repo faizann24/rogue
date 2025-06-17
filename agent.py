@@ -29,7 +29,7 @@ class Agent:
     def __init__(self, starting_url: str, expand_scope: bool = False, 
                  enumerate_subdomains: bool = False, model: str = 'o3-mini',
                  output_dir: str = 'security_results', max_iterations: int = 10,
-                 num_plans: int = 10, disable_rag: bool = False):
+                 num_plans: int = 10, disable_rag: bool = False, disable_iterative: bool = False):
         """
         Initialize the security testing agent.
 
@@ -42,6 +42,7 @@ class Agent:
             max_iterations: Maximum iterations per test plan
             num_plans: Number of security testing plans to generate per page (default: 10)
             disable_rag: Whether to disable RAG knowledge fetching (default: False)
+            disable_iterative: Whether to disable iterative planning (default: False)
         """
         self.starting_url = starting_url
         self.expand_scope = expand_scope
@@ -51,6 +52,7 @@ class Agent:
         self.max_iterations = max_iterations
         self.num_plans = num_plans
         self.keep_messages = 15
+        self.disable_iterative = disable_iterative
 
         # Fetch security knowledge once at initialization (unless disabled)
         if disable_rag:
@@ -151,87 +153,266 @@ class Agent:
                 {"role": "user", "content": page_data}
             ]
             
-            # Add the plan to the history
-            logger.info("Generating a plan for security testing", color='cyan')
-            total_tokens += count_tokens(page_data)
-            plans = self.planner.plan(page_data)
-
-            # Output the full plan first
-            total_plans = len(plans)
-            for index, plan in enumerate(plans):
-                logger.info(f"Plan {index + 1}/{total_plans}: {plan['title']}", color='light_magenta')
-
-            for index, plan in enumerate(plans):
-                # Reset history when we are in a new plan
-                self.history = self.history[:2]
-
-                # Execute plan
-                logger.info(f"{index + 1}/{total_plans}: {plan['title']}", color='cyan')
-                self.history.append({"role": "assistant", "content": f"I will now start exploring the ```{plan['title']} - {plan['description']}``` and see if I can find any issues around it. Are we good to go?"})
-                self.history.append({"role": "user", "content": "Sure, let us start exploring this by trying out some tools. We must stick to the plan and do not deviate from it. Once we are done, simply call the completed function."})
+            # Choose planning strategy based on disable_iterative flag
+            if self.disable_iterative:
+                # Legacy planning: generate all plans at once
+                logger.info("Generating security plans (legacy mode)", color='cyan')
+                total_tokens += count_tokens(page_data)
+                plans = self.planner.plan(page_data)
                 
-                # Execute the plan iterations
-                iterations = 0
-                while iterations < self.max_iterations:
-                    # Manage history size - keep first 4 messages
-                    if len(self.history) > self.keep_messages:
-                        # First four messages are important and we need to keep them
-                        keep_from_end = self.keep_messages - 4
-                        self.history = self.history[:4] + Summarizer().summarize_conversation(self.history[4:-keep_from_end]) + self.history[-keep_from_end:]
-                        
-                    # Send the request to the LLM
-                    plan_tokens = count_tokens(self.history)
-                    total_tokens += plan_tokens
-                    logger.info(f"Total tokens used till now: {total_tokens:,}, current query tokens: {plan_tokens:,}", color='red')
-
-                    llm_response = self.llm.reason(self.history)
-                    self.history.append({"role": "assistant", "content": llm_response})
-                    logger.info(f"{llm_response}", color='light_blue')
-
-                    # Extract and execute the tool use from the LLM response
-                    tool_use = self.tools.extract_tool_use(llm_response)
-                    logger.info(f"{tool_use}", color='yellow')
-
-                    tool_output = str(self.tools.execute_tool(page, tool_use))
-                    logger.info(f"{tool_output[:250]}{'...' if len(tool_output) > 250 else ''}", color='yellow')
-
-                    total_tokens += count_tokens(tool_output)
+                # Output the full plan first
+                total_plans = len(plans)
+                for index, plan in enumerate(plans):
+                    logger.info(f"Plan {index + 1}/{total_plans}: {plan['title']}", color='light_magenta')
+                
+                # Execute all plans using legacy method
+                self._execute_legacy_plans(plans, page, total_tokens)
+            else:
+                # Iterative planning: generate plans in batches with learning
+                logger.info("Starting iterative security planning", color='cyan')
+                total_tokens += count_tokens(page_data)
+                
+                # Determine batch size for iterative planning
+                if self.num_plans == -1:
+                    # For unlimited plans, generate in batches of 5
+                    batch_size = 5
+                    max_batches = 5  # Maximum 25 plans total
+                else:
+                    # For fixed plans, divide into 3 batches (33% each)
+                    batch_size = max(1, self.num_plans // 3)
+                    max_batches = 3
+                
+                all_plans = []
+                execution_insights = []
+                
+                for batch_num in range(max_batches):
+                    logger.info(f"🧠 Generating plan batch {batch_num + 1}/{max_batches}", color='cyan')
                     
-                    tool_output_summarized = Summarizer().summarize(llm_response, tool_use, tool_output)
-                    self.history.append({"role": "user", "content": tool_output_summarized})
-                    logger.info(f"{tool_output_summarized}", color='cyan')       
-
-                    if tool_output == "Completed":
-                        total_tokens += count_tokens(self.history[2:])
-                        successful_exploit, report = self.reporter.report(self.history[2:])
-                        logger.info(f"Analysis of the issue the agent has found: {report}", color='green')
-                        
-                        if successful_exploit:
-                            logger.info("Completed, moving onto the next plan!", color='yellow')
+                    # Build context for this batch
+                    planning_context = page_data
+                    
+                    # Add insights from previous plan executions
+                    if execution_insights:
+                        insights_summary = "\n\n=== INSIGHTS FROM PREVIOUS SECURITY TESTS ===\n"
+                        insights_summary += "\n".join(execution_insights)
+                        insights_summary += "\n\nUse these insights to generate more targeted and effective security test plans that build upon what we've learned.\n"
+                        planning_context += insights_summary
+                    
+                    # Generate plans for this batch
+                    if self.num_plans == -1:
+                        # For unlimited, generate batch_size plans per batch
+                        batch_plans = self.planner.plan_batch(planning_context, batch_size)
+                    else:
+                        # For fixed plans, calculate remaining plans needed
+                        remaining_plans = self.num_plans - len(all_plans)
+                        if remaining_plans <= 0:
                             break
-                        else:
-                            logger.info("Need to work harder on the exploit.", color='red')
-                            self.history.append({"role": "user", "content": report + "\n. Lets do better, again!"})
+                        batch_plans = self.planner.plan_batch(planning_context, min(batch_size, remaining_plans))
                     
-                    # Print traffic
-                    wait_for_network_idle(page)
-                    traffic = self.proxy.pretty_print_traffic()
-                    if traffic:
-                        logger.info(traffic, color='cyan')
-                        self.history.append({"role": "user", "content": traffic})
-                        total_tokens += count_tokens(traffic)
-                    # Clear proxy
-                    self.proxy.clear()
-
-                    # Continue
-                    iterations += 1
-                    if iterations >= self.max_iterations:
-                        logger.info("Max iterations reached, moving onto the next plan!", color='red')
+                    if not batch_plans:
+                        logger.info("No more plans generated, stopping iterative planning", color='yellow')
+                        break
+                    
+                    all_plans.extend(batch_plans)
+                    
+                    # Execute this batch of plans and collect insights
+                    batch_insights = self._execute_plan_batch(batch_plans, batch_num + 1, len(all_plans), page, total_tokens)
+                    execution_insights.extend(batch_insights)
+                    
+                    # Update total tokens from batch execution
+                    total_tokens = batch_insights[-1] if batch_insights and isinstance(batch_insights[-1], int) else total_tokens
+                    if isinstance(batch_insights[-1], int):
+                        execution_insights = execution_insights[:-1]  # Remove token count from insights
+                    
+                    logger.info(f"✅ Completed batch {batch_num + 1}, total plans executed: {len(all_plans)}", color='green')
+                    
+                    # For unlimited plans, stop if we've generated enough or no new insights
+                    if self.num_plans == -1 and len(all_plans) >= 20:
+                        logger.info("Reached sufficient plan coverage for unlimited mode", color='green')
                         break
 
         # Generate and save report
         logger.info("Generating summary report", color='yellow')
         self.reporter.generate_summary_report()
+    
+    def _execute_plan_batch(self, plans: list, batch_num: int, total_executed: int, page, current_tokens: int) -> list:
+        """
+        Execute a batch of plans and return insights for next batch planning.
+        
+        Args:
+            plans: List of plans to execute
+            batch_num: Current batch number
+            total_executed: Total number of plans executed so far
+            page: Playwright page object
+            current_tokens: Current token count
+            
+        Returns:
+            List of insights from plan execution + final token count
+        """
+        insights = []
+        total_tokens = current_tokens
+        
+        for index, plan in enumerate(plans):
+            plan_number = total_executed - len(plans) + index + 1
+            
+            # Reset history when we are in a new plan
+            self.history = self.history[:2]
+
+            # Execute plan
+            logger.info(f"{plan_number}/{total_executed}: {plan['title']}", color='cyan')
+            self.history.append({"role": "assistant", "content": f"I will now start exploring the ```{plan['title']} - {plan['description']}``` and see if I can find any issues around it. Are we good to go?"})
+            self.history.append({"role": "user", "content": "Sure, let us start exploring this by trying out some tools. We must stick to the plan and do not deviate from it. Once we are done, simply call the completed function."})
+            
+            # Execute the plan iterations
+            iterations = 0
+            plan_insights = []
+            
+            while iterations < self.max_iterations:
+                # Manage history size - keep first 4 messages
+                if len(self.history) > self.keep_messages:
+                    # First four messages are important and we need to keep them
+                    keep_from_end = self.keep_messages - 4
+                    self.history = self.history[:4] + Summarizer().summarize_conversation(self.history[4:-keep_from_end]) + self.history[-keep_from_end:]
+                    
+                # Send the request to the LLM
+                plan_tokens = count_tokens(self.history)
+                total_tokens += plan_tokens
+                logger.info(f"Total tokens used till now: {total_tokens:,}, current query tokens: {plan_tokens:,}", color='red')
+
+                llm_response = self.llm.reason(self.history)
+                self.history.append({"role": "assistant", "content": llm_response})
+                logger.info(f"{llm_response}", color='light_blue')
+
+                # Extract and execute the tool use from the LLM response
+                tool_use = self.tools.extract_tool_use(llm_response)
+                logger.info(f"{tool_use}", color='yellow')
+
+                tool_output = str(self.tools.execute_tool(page, tool_use))
+                logger.info(f"{tool_output[:250]}{'...' if len(tool_output) > 250 else ''}", color='yellow')
+
+                total_tokens += count_tokens(tool_output)
+                
+                tool_output_summarized = Summarizer().summarize(llm_response, tool_use, tool_output)
+                self.history.append({"role": "user", "content": tool_output_summarized})
+                logger.info(f"{tool_output_summarized}", color='cyan')       
+
+                if tool_output == "Completed":
+                    total_tokens += count_tokens(self.history[2:])
+                    successful_exploit, report = self.reporter.report(self.history[2:])
+                    logger.info(f"Analysis of the issue the agent has found: {report}", color='green')
+                    
+                    # Collect insights from this plan execution
+                    if successful_exploit:
+                        plan_insights.append(f"✅ {plan['title']}: SUCCESSFUL - {report[:200]}...")
+                        logger.info("Completed, moving onto the next plan!", color='yellow')
+                        break
+                    else:
+                        plan_insights.append(f"❌ {plan['title']}: Failed - {report[:200]}...")
+                        logger.info("Need to work harder on the exploit.", color='red')
+                        self.history.append({"role": "user", "content": report + "\n. Lets do better, again!"})
+                
+                # Print traffic
+                wait_for_network_idle(page)
+                traffic = self.proxy.pretty_print_traffic()
+                if traffic:
+                    logger.info(traffic, color='cyan')
+                    self.history.append({"role": "user", "content": traffic})
+                    total_tokens += count_tokens(traffic)
+                # Clear proxy
+                self.proxy.clear()
+
+                # Continue
+                iterations += 1
+                if iterations >= self.max_iterations:
+                    plan_insights.append(f"⏱️ {plan['title']}: Max iterations reached - partial execution")
+                    logger.info("Max iterations reached, moving onto the next plan!", color='red')
+                    break
+            
+            # Add plan insights to batch insights
+            insights.extend(plan_insights)
+        
+        # Add token count as last element for tracking
+        insights.append(total_tokens)
+        return insights
+
+    def _execute_legacy_plans(self, plans: list, page, current_tokens: int):
+        """
+        Execute plans using the original legacy method (all plans generated upfront).
+        
+        Args:
+            plans: List of all plans to execute
+            page: Playwright page object
+            current_tokens: Current token count
+        """
+        total_tokens = current_tokens
+        
+        for index, plan in enumerate(plans):
+            # Reset history when we are in a new plan
+            self.history = self.history[:2]
+
+            # Execute plan
+            logger.info(f"{index + 1}/{len(plans)}: {plan['title']}", color='cyan')
+            self.history.append({"role": "assistant", "content": f"I will now start exploring the ```{plan['title']} - {plan['description']}``` and see if I can find any issues around it. Are we good to go?"})
+            self.history.append({"role": "user", "content": "Sure, let us start exploring this by trying out some tools. We must stick to the plan and do not deviate from it. Once we are done, simply call the completed function."})
+            
+            # Execute the plan iterations
+            iterations = 0
+            while iterations < self.max_iterations:
+                # Manage history size - keep first 4 messages
+                if len(self.history) > self.keep_messages:
+                    # First four messages are important and we need to keep them
+                    keep_from_end = self.keep_messages - 4
+                    self.history = self.history[:4] + Summarizer().summarize_conversation(self.history[4:-keep_from_end]) + self.history[-keep_from_end:]
+                    
+                # Send the request to the LLM
+                plan_tokens = count_tokens(self.history)
+                total_tokens += plan_tokens
+                logger.info(f"Total tokens used till now: {total_tokens:,}, current query tokens: {plan_tokens:,}", color='red')
+
+                llm_response = self.llm.reason(self.history)
+                self.history.append({"role": "assistant", "content": llm_response})
+                logger.info(f"{llm_response}", color='light_blue')
+
+                # Extract and execute the tool use from the LLM response
+                tool_use = self.tools.extract_tool_use(llm_response)
+                logger.info(f"{tool_use}", color='yellow')
+
+                tool_output = str(self.tools.execute_tool(page, tool_use))
+                logger.info(f"{tool_output[:250]}{'...' if len(tool_output) > 250 else ''}", color='yellow')
+
+                total_tokens += count_tokens(tool_output)
+                
+                tool_output_summarized = Summarizer().summarize(llm_response, tool_use, tool_output)
+                self.history.append({"role": "user", "content": tool_output_summarized})
+                logger.info(f"{tool_output_summarized}", color='cyan')       
+
+                if tool_output == "Completed":
+                    total_tokens += count_tokens(self.history[2:])
+                    successful_exploit, report = self.reporter.report(self.history[2:])
+                    logger.info(f"Analysis of the issue the agent has found: {report}", color='green')
+                    
+                    if successful_exploit:
+                        logger.info("Completed, moving onto the next plan!", color='yellow')
+                        break
+                    else:
+                        logger.info("Need to work harder on the exploit.", color='red')
+                        self.history.append({"role": "user", "content": report + "\n. Lets do better, again!"})
+                
+                # Print traffic
+                wait_for_network_idle(page)
+                traffic = self.proxy.pretty_print_traffic()
+                if traffic:
+                    logger.info(traffic, color='cyan')
+                    self.history.append({"role": "user", "content": traffic})
+                    total_tokens += count_tokens(traffic)
+                # Clear proxy
+                self.proxy.clear()
+
+                # Continue
+                iterations += 1
+                if iterations >= self.max_iterations:
+                    logger.info("Max iterations reached, moving onto the next plan!", color='red')
+                    break
 
     def _build_scanner_context(self, scan_results: dict, page) -> dict:
         """
